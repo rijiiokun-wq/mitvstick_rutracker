@@ -1,0 +1,17 @@
+.gradle/
+.idea/
+build/
+**/build/
+local.properties
+*.iml
+.DS_Store
+*.log
+*.jks
+*.keystore
+keystore.properties
+captures/
+
+# Local device-administration notes and one-off diagnostics are not part of
+# the public Android application source.
+TV_CLEANUP_ROLLBACK.md
+camera_probe_tmp.go

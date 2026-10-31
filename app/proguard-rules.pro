@@ -1,0 +1,1 @@
+# MVP: shrinking is disabled.
