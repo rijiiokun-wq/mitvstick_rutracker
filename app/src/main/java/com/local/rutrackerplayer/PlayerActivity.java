@@ -333,8 +333,9 @@ public final class PlayerActivity extends Activity {
         saveProgress();
         progressHandler.removeCallbacksAndMessages(null);
         stopPlaybackMonitoring();
-        statsClient.destroy();
         if (player != null) { player.release(); player = null; }
+        TorrServerClient.dropTorrentAsync(torrentHash);
+        statsClient.destroy();
         super.onStop();
         if (finishAfterStop) finish();
     }

@@ -16,8 +16,8 @@ android {
         applicationId 'com.local.rutrackerplayer'
         minSdk 28
         targetSdk 34
-        versionCode 8
-        versionName '0.2.6'
+        versionCode 9
+        versionName '0.2.7'
         buildConfigField 'long', 'SPEED_OVERLAY_TIMEOUT_MS', "${speedOverlayTimeoutMs}L"
     }
 

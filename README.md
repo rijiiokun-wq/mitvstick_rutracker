@@ -66,7 +66,7 @@ Tested configuration:
 
    ```sh
    adb connect TV_IP_ADDRESS:ADB_PORT
-   adb install -r rutracker-tv-0.2.6.apk
+   adb install -r rutracker-tv-0.2.7.apk
    ```
 
 5. Open **RuTracker Player**, select **Sign in**, complete any browser checks,
@@ -93,6 +93,24 @@ No finite buffer can guarantee uninterrupted playback when the average torrent
 speed remains below the movie bitrate. For example, a 120+ GB movie lasting
 about 2.5 hours may require roughly 13–14 MB/s throughout playback. If peers
 only provide 4 MB/s, choose a smaller release or a better-seeded torrent.
+
+### Suggested TorrServer settings for 2 GB TV sticks
+
+The following values gave a substantially faster start on the tested Xiaomi
+TV Stick 4K without putting its limited flash or memory under unnecessary
+pressure:
+
+- memory cache: **64 MiB**;
+- preload: **20%** (about 13 MiB before playback);
+- connection limit: **50**;
+- download rate limit: **unlimited**;
+- TCP, µTP, DHT, and PEX: **enabled**;
+- responsive mode: **enabled**;
+- disk cache: **disabled**.
+
+The application unloads its active torrent as soon as playback closes. This is
+important on a VPN connection because an abandoned preload can otherwise keep
+using peers and bandwidth while the next selection starts.
 
 ## Privacy and security
 
@@ -142,6 +160,8 @@ sideloading. Do not commit signing keystores or passwords to the repository.
   automatically; episode selection is not implemented yet.
 - RuTracker may occasionally require a manual browser verification or sign-in.
 - Torrent availability and speed depend entirely on peers and network routing.
+- Leaving playback immediately unloads that torrent, so an abandoned preload
+  does not compete with the next selection for peers or VPN bandwidth.
 - The release does not bundle TorrServe or TorrServer.
 
 ## Third-party software

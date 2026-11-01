@@ -196,6 +196,27 @@ final class TorrServerClient {
         return new JSONObject(readResponse(connection));
     }
 
+    /**
+     * Unloads a stream that this app no longer reads. TorrServer otherwise keeps
+     * the old reader alive for its disconnect timeout, so a cancelled preload can
+     * compete with the next movie for peers and VPN bandwidth.
+     */
+    static void dropTorrentAsync(String hash) {
+        if (hash == null || !hash.matches("(?i)[0-9a-f]{40}")) return;
+        Thread cleanup = new Thread(() -> {
+            try {
+                JSONObject request = new JSONObject();
+                request.put("action", "drop");
+                request.put("hash", hash);
+                postJson("/torrents", request);
+            } catch (Throwable ignored) {
+                // The server also expires disconnected readers by itself. This
+                // best-effort request only shortens that window.
+            }
+        }, "torrserver-drop");
+        cleanup.start();
+    }
+
     private static JSONObject uploadTorrent(File file, String title) throws Exception {
         String boundary = "----RutrackerTv" + System.currentTimeMillis();
         HttpURLConnection connection = open("/torrent/upload", "POST", 10_000, 30_000);
