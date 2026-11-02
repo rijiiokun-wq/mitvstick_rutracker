@@ -379,16 +379,16 @@ public final class PlayerActivity extends Activity {
         TextView label = new TextView(this);
         label.setText("Скачивание: —");
         label.setTextColor(Color.argb(240, 255, 255, 255));
-        label.setTextSize(18);
-        label.setPadding(dp(14), dp(9), dp(14), dp(9));
+        label.setTextSize(9);
+        label.setPadding(dp(7), dp(9) / 2, dp(7), dp(9) / 2);
         label.setFocusable(false);
         label.setClickable(false);
         label.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         label.setVisibility(View.GONE);
-        label.setElevation(dp(8));
+        label.setElevation(dp(4));
         GradientDrawable background = new GradientDrawable();
         background.setColor(Color.argb(150, 0, 0, 0));
-        background.setCornerRadius(dp(10));
+        background.setCornerRadius(dp(5));
         label.setBackground(background);
         return label;
     }

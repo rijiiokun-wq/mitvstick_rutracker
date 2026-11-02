@@ -51,8 +51,8 @@ CPU architecture of the TV device.
 - One automatic restart from the beginning if TorrServer returns HTTP 416 for
   an invalid byte range.
 - Resume prompt with **Continue** and **Start from beginning** choices.
-- Download-speed and forward-buffer overlay for the first 10 minutes of active
-  playback.
+- Compact download-speed and forward-buffer overlay for the first 30 seconds
+  of active playback. Pauses and buffering do not count toward this timeout.
 - Adaptive buffering for large files:
   - longer initial buffering for UHD releases;
   - automatic buffer growth when download speed is close to the media bitrate;
@@ -91,7 +91,7 @@ Tested configuration:
 
    ```sh
    adb connect TV_IP_ADDRESS:ADB_PORT
-   adb install -r rutracker-tv-0.3.1.apk
+   adb install -r rutracker-tv-0.3.2.apk
    ```
 
 5. Open **RuTracker Player**, select **Sign in**, complete any browser checks,
