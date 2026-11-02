@@ -4,6 +4,20 @@ An unofficial, remote-friendly Android TV application for searching RuTracker,
 selecting a well-seeded release, and streaming it through a separately installed
 [TorrServe/TorrServer](https://github.com/YouROK/TorrServe) instance.
 
+## Latest release: 0.3.2
+
+**[Download the Android TV APK](https://github.com/rijiiokun-wq/mitvstick_rutracker/releases/download/v0.3.2/rutracker-tv-0.3.2.apk)**
+ · [Release notes](https://github.com/rijiiokun-wq/mitvstick_rutracker/releases/tag/v0.3.2)
+
+The playback speed/buffer overlay is now half its previous size and hides after
+30 seconds of active playback. Pauses and buffering do not count toward the
+timeout. This version also includes the AVI playback, audio timing and automatic
+frame-rate matching fixes introduced in 0.3.1.
+
+Install the APK over the existing app to preserve your sign-in, favourites,
+history and saved positions. Android TV 9+ and a separately installed TorrServe
+are required; see the installation steps below.
+
 The application was built for a Xiaomi TV Stick 4K, but the APK contains no
 native code and should work on many Android TV devices running Android 9 or
 newer. TorrServe is a separate dependency and its server binary must match the
