@@ -30,11 +30,20 @@ CPU architecture of the TV device.
   reported by the torrent and are shown with their full path and size.
 - Streaming through TorrServer on `127.0.0.1:8090`.
 - Built-in Media3 player.
+- Source frame-rate matching on Android 11+ (including fractional movie rates),
+  respecting Android's Match content frame rate setting. HDMI may briefly go
+  black while the TV switches modes. Android and the TV make the final mode choice.
 - Compatibility handling for older AVI releases:
   - Media3 1.11.1 includes the AVI audio-chunk fix needed by releases whose
     audio stream does not mark every chunk as a keyframe;
   - AC3 bytes split across arbitrary AVI chunks are joined and emitted as real
     AC3 syncframes, preventing periodic timestamp jumps during passthrough;
+  - AC3 resume/seek timing uses actual indexed audio-byte positions instead of
+    assuming the requested seek time is where the file reader landed;
+  - MPEG-4 Part 2 B-frame presentation timestamps are reconstructed from the
+    video bitstream, preventing backward timestamp jumps and dropped frames;
+  - the AVI stream header supplies the exact source frame rate, so display
+    matching also works when the original extractor omits that information;
   - MPEG-4 Part 2/XVID prefers the Amlogic hardware decoder on the tested
     Xiaomi stick, with decoder fallback enabled;
   - supported AC3 uses the TV/HDMI direct-output path, avoiding the affected
@@ -82,7 +91,7 @@ Tested configuration:
 
    ```sh
    adb connect TV_IP_ADDRESS:ADB_PORT
-   adb install -r rutracker-tv-0.3.0.apk
+   adb install -r rutracker-tv-0.3.1.apk
    ```
 
 5. Open **RuTracker Player**, select **Sign in**, complete any browser checks,
@@ -166,6 +175,12 @@ Output:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
+Run the AVI timing and frame-cadence regression tests and Android lint:
+
+```sh
+./gradlew :app:testDebugUnitTest :app:lintDebug
+```
+
 The public release APK is currently debug-signed for straightforward
 sideloading. Updating with a build signed by a different key requires
 uninstalling the old app first, which removes its local session and history.
@@ -191,6 +206,12 @@ Do not commit signing keystores or passwords to the repository.
 - Leaving playback immediately unloads that torrent, so an abandoned preload
   does not compete with the next selection for peers or VPN bandwidth.
 - The release does not bundle TorrServe or TorrServer.
+- Packed multi-picture DivX packets and malformed MPEG-4 timing retain the
+  original extractor behaviour; the compatibility fix targets ordinary
+  MPEG-4 Part 2 AVI packets.
+
+See [0.3.1 playback validation](docs/validation-0.3.1.md) for measured results
+on the tested stick and the limits of those checks.
 
 ## Third-party software
 

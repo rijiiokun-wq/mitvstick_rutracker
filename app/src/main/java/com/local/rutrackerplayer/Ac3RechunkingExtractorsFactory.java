@@ -12,10 +12,14 @@ import androidx.media3.common.util.Util;
 import androidx.media3.extractor.Ac3Util;
 import androidx.media3.extractor.DefaultExtractorsFactory;
 import androidx.media3.extractor.Extractor;
+import androidx.media3.extractor.ExtractorInput;
 import androidx.media3.extractor.ExtractorOutput;
 import androidx.media3.extractor.ExtractorsFactory;
 import androidx.media3.extractor.ForwardingExtractor;
 import androidx.media3.extractor.ForwardingExtractorOutput;
+import androidx.media3.extractor.ForwardingExtractorInput;
+import androidx.media3.extractor.ForwardingTrackOutput;
+import androidx.media3.extractor.PositionHolder;
 import androidx.media3.extractor.TrackOutput;
 import androidx.media3.extractor.avi.AviExtractor;
 import java.io.EOFException;
@@ -60,6 +64,8 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
 
     private static final class Ac3RechunkingExtractor extends ForwardingExtractor {
         private final Map<Integer, Ac3TrackOutput> audioTracks = new HashMap<>();
+        private final Map<Integer, AviVideoTrackOutput> videoTracks = new HashMap<>();
+        private final AviAudioClock audioClock = new AviAudioClock();
 
         Ac3RechunkingExtractor(Extractor delegate) {
             super(delegate);
@@ -69,10 +75,14 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
             super.init(new ForwardingExtractorOutput(output) {
                 @Override public TrackOutput track(int id, @C.TrackType int type) {
                     TrackOutput target = super.track(id, type);
+                    if (type == C.TRACK_TYPE_VIDEO) {
+                        return videoTracks.computeIfAbsent(id,
+                                ignored -> new AviVideoTrackOutput(target, audioClock.stream(id)));
+                    }
                     if (type != C.TRACK_TYPE_AUDIO) return target;
                     Ac3TrackOutput existing = audioTracks.get(id);
                     if (existing != null) return existing;
-                    Ac3TrackOutput created = new Ac3TrackOutput(target);
+                    Ac3TrackOutput created = new Ac3TrackOutput(target, audioClock.stream(id));
                     audioTracks.put(id, created);
                     return created;
                 }
@@ -80,16 +90,146 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
         }
 
         @Override public void seek(long position, long timeUs) {
-            for (Ac3TrackOutput output : audioTracks.values()) output.reset(timeUs);
+            for (Ac3TrackOutput output : audioTracks.values()) output.reset();
+            for (AviVideoTrackOutput output : videoTracks.values()) output.reset();
             super.seek(position, timeUs);
+        }
+
+        @Override public int read(ExtractorInput input, PositionHolder seekPosition) throws IOException {
+            // Observe the header/index bytes that AviExtractor already reads; no
+            // extra range requests or duplicate retained copy of idx1 are needed.
+            return super.read(new ForwardingExtractorInput(input) {
+                @Override public void readFully(byte[] target, int offset, int length) throws IOException {
+                    long position = getPosition();
+                    super.readFully(target, offset, length);
+                    audioClock.observe(position, target, offset, length);
+                }
+                @Override public boolean readFully(byte[] target, int offset, int length,
+                        boolean allowEndOfInput) throws IOException {
+                    long position = getPosition();
+                    boolean read = super.readFully(target, offset, length, allowEndOfInput);
+                    if (read) audioClock.observe(position, target, offset, length);
+                    return read;
+                }
+                @Override public void peekFully(byte[] target, int offset, int length) throws IOException {
+                    long position = getPeekPosition();
+                    super.peekFully(target, offset, length);
+                    audioClock.observe(position, target, offset, length);
+                }
+            }, seekPosition);
         }
     }
 
-    private static final class Ac3TrackOutput implements TrackOutput {
+    static final class AviVideoTrackOutput extends ForwardingTrackOutput {
+        private static final int PREFIX_LIMIT = 64 * 1024;
+        private final AviAudioClock.Stream clock;
+        private final Mpeg4VopClock vopClock = new Mpeg4VopClock();
+        private final byte[] prefix = new byte[PREFIX_LIMIT];
+        private int prefixSize;
+        private int startCode = -1;
+        private int vopCount;
+        private long packetSize;
+        private boolean correctMpeg4Timing;
+
+        AviVideoTrackOutput(TrackOutput target, AviAudioClock.Stream clock) {
+            super(target);
+            this.clock = clock;
+        }
+
+        @Override public void format(Format format) {
+            // Media3's AVI extractor timestamps frames with rate/scale but omits
+            // that rate from Format. Supply it before codec configuration, so
+            // scheduling and display matching do not infer cadence from drops.
+            if (format.frameRate <= 0 && clock.frameRate > 0) {
+                format = format.buildUpon().setFrameRate(clock.frameRate).build();
+            }
+            correctMpeg4Timing = MimeTypes.VIDEO_MP4V.equals(format.sampleMimeType);
+            if (correctMpeg4Timing) {
+                for (byte[] initialization : format.initializationData) {
+                    vopClock.configure(initialization);
+                }
+            }
+            super.format(format);
+        }
+
+        @Override public int sampleData(DataReader input, int length,
+                boolean allowEndOfInput, @SampleDataPart int sampleDataPart) throws IOException {
+            if (!correctMpeg4Timing || sampleDataPart != SAMPLE_DATA_PART_MAIN) {
+                return super.sampleData(input, length, allowEndOfInput, sampleDataPart);
+            }
+            // Capture only a bounded header prefix. The decoder receives the
+            // original bytes immediately, in their original coded packet order.
+            return super.sampleData((target, offset, count) -> {
+                int read = input.read(target, offset, count);
+                if (read > 0) observe(target, offset, read);
+                return read;
+            }, length, allowEndOfInput, sampleDataPart);
+        }
+
+        @Override public int sampleData(DataReader input, int length,
+                boolean allowEndOfInput) throws IOException {
+            // ForwardingTrackOutput forwards this overload straight to its
+            // delegate. AVI uses it, so explicitly route through our observer.
+            return sampleData(input, length, allowEndOfInput, SAMPLE_DATA_PART_MAIN);
+        }
+
+        @Override public void sampleData(ParsableByteArray data, int length,
+                @SampleDataPart int sampleDataPart) {
+            if (correctMpeg4Timing && sampleDataPart == SAMPLE_DATA_PART_MAIN) {
+                observe(data.getData(), data.getPosition(), length);
+            }
+            super.sampleData(data, length, sampleDataPart);
+        }
+
+        @Override public void sampleData(ParsableByteArray data, int length) {
+            sampleData(data, length, SAMPLE_DATA_PART_MAIN);
+        }
+
+        @Override public void sampleMetadata(long timeUs, @C.BufferFlags int flags,
+                int size, int offset, CryptoData cryptoData) {
+            if (correctMpeg4Timing && offset == 0 && size == packetSize && cryptoData == null) {
+                timeUs = vopClock.timestamp(prefix, prefixSize, vopCount, timeUs);
+            } else if (correctMpeg4Timing) {
+                // AVI normally has offset=0 and no encryption. Unexpected
+                // framing must not reuse a clock derived from another sample.
+                vopClock.reset();
+            }
+            super.sampleMetadata(timeUs, flags, size, offset, cryptoData);
+            clearPacket();
+        }
+
+        void reset() {
+            clearPacket();
+            vopClock.reset();
+        }
+
+        private void observe(byte[] data, int offset, int length) {
+            int capture = Math.min(length, prefix.length - prefixSize);
+            System.arraycopy(data, offset, prefix, prefixSize, capture);
+            prefixSize += capture;
+            packetSize += length;
+            // Scan the entire packet, including bytes beyond the retained
+            // prefix, to reject packed multi-VOP samples without allocating.
+            for (int p = offset; p < offset + length; p++) {
+                startCode = (startCode << 8) | (data[p] & 255);
+                if (startCode == 0x000001b6) vopCount++;
+            }
+        }
+
+        private void clearPacket() {
+            prefixSize = 0;
+            packetSize = 0;
+            startCode = -1;
+            vopCount = 0;
+        }
+    }
+
+    static final class Ac3TrackOutput implements TrackOutput {
         private static final int INITIAL_CAPACITY = 32 * 1024;
         private static final int MAX_SYNCFRAME_SIZE = 1024 * 1024;
 
         private final TrackOutput delegate;
+        private final AviAudioClock.Stream clock;
         private final byte[] syncHeader = new byte[6];
         private byte[] pending = new byte[INITIAL_CAPACITY];
         private int pendingSize;
@@ -97,9 +237,12 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
         private int sampleRate = 48_000;
         private long baseTimeUs = C.TIME_UNSET;
         private long emittedSamples;
+        private long skippedBeforeFirstFrame;
+        private boolean inputPositionCaptured;
 
-        Ac3TrackOutput(TrackOutput delegate) {
+        Ac3TrackOutput(TrackOutput delegate, AviAudioClock.Stream clock) {
             this.delegate = delegate;
+            this.clock = clock;
         }
 
         @Override public void durationUs(long durationUs) {
@@ -107,9 +250,9 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
         }
 
         @Override public void format(Format format) {
-            rechunk = MimeTypes.AUDIO_AC3.equals(format.sampleMimeType)
-                    || MimeTypes.AUDIO_E_AC3.equals(format.sampleMimeType)
-                    || MimeTypes.AUDIO_E_AC3_JOC.equals(format.sampleMimeType);
+            // The byte-rate index clock is valid for constant-bitrate AC3.
+            // E-AC3 dependent substreams require different access-unit grouping.
+            rechunk = MimeTypes.AUDIO_AC3.equals(format.sampleMimeType);
             if (format.sampleRate > 0) sampleRate = format.sampleRate;
             delegate.format(format);
         }
@@ -118,6 +261,11 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
                 boolean allowEndOfInput, @SampleDataPart int sampleDataPart) throws IOException {
             if (!rechunk || sampleDataPart != SAMPLE_DATA_PART_MAIN) {
                 return delegate.sampleData(input, length, allowEndOfInput, sampleDataPart);
+            }
+            if (!inputPositionCaptured && input instanceof ExtractorInput) {
+                long exactTimeUs = clock.timeUs(((ExtractorInput) input).getPosition());
+                if (exactTimeUs != Long.MIN_VALUE) baseTimeUs = exactTimeUs;
+                inputPositionCaptured = true;
             }
             ensureCapacity(pendingSize + length);
             int read = input.read(pending, pendingSize, length);
@@ -152,10 +300,14 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
             emitCompleteFrames();
         }
 
-        void reset(long timeUs) {
+        void reset() {
             pendingSize = 0;
             emittedSamples = 0;
-            baseTimeUs = timeUs;
+            skippedBeforeFirstFrame = 0;
+            inputPositionCaptured = false;
+            // The requested position is not the timestamp at the chosen AVI
+            // keyframe. Anchor to actual indexed audio bytes or chunk metadata.
+            baseTimeUs = C.TIME_UNSET;
         }
 
         private void emitCompleteFrames() {
@@ -165,12 +317,14 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
                 if ((pending[cursor] & 0xFF) != 0x0B
                         || (pending[cursor + 1] & 0xFF) != 0x77) {
                     cursor++;
+                    if (emittedSamples == 0) skippedBeforeFirstFrame++;
                     continue;
                 }
                 System.arraycopy(pending, cursor, syncHeader, 0, syncHeader.length);
                 int frameSize = Ac3Util.parseAc3SyncframeSize(syncHeader);
                 if (frameSize <= 0 || frameSize > MAX_SYNCFRAME_SIZE) {
                     cursor++;
+                    if (emittedSamples == 0) skippedBeforeFirstFrame++;
                     continue;
                 }
                 if (pendingSize - cursor < frameSize) break;
@@ -180,7 +334,9 @@ final class Ac3RechunkingExtractorsFactory implements ExtractorsFactory {
                 ParsableByteArray frameData = new ParsableByteArray(pending, pendingSize);
                 frameData.setPosition(cursor);
                 delegate.sampleData(frameData, frameSize, SAMPLE_DATA_PART_MAIN);
-                long timeUs = baseTimeUs + Util.scaleLargeTimestamp(
+                long syncOffsetUs = clock.bytesPerSecond > 0
+                        ? skippedBeforeFirstFrame * C.MICROS_PER_SECOND / clock.bytesPerSecond : 0;
+                long timeUs = baseTimeUs + syncOffsetUs + Util.scaleLargeTimestamp(
                         emittedSamples, C.MICROS_PER_SECOND, sampleRate);
                 delegate.sampleMetadata(timeUs, C.BUFFER_FLAG_KEY_FRAME,
                         frameSize, 0, null);

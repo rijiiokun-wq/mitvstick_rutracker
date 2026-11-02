@@ -8,21 +8,29 @@ import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
+import android.view.SurfaceView;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 import androidx.annotation.OptIn;
 import androidx.media3.common.MediaItem;
+import androidx.media3.common.Format;
+import androidx.media3.common.C;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.DecoderCounters;
+import androidx.media3.exoplayer.DecoderReuseEvaluation;
+import androidx.media3.exoplayer.analytics.AnalyticsListener;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.audio.DefaultAudioSink;
@@ -51,7 +59,7 @@ public final class PlayerActivity extends Activity {
     static final String EXTRA_SEEDS = "result_seeds";
     static final String EXTRA_START_POSITION_MS = "start_position_ms";
     private static final long SPEED_POLL_INTERVAL_MS = 1_000;
-    private static final long OVERLAY_TICK_MS = 500;
+    private static final long OVERLAY_TICK_MS = 1_000;
     private static final long PROGRESS_SAVE_INTERVAL_MS = 5_000;
     private static final long MIN_RESUME_POSITION_MS = 15_000;
     private static final long COMPLETION_MARGIN_MS = 60_000;
@@ -60,6 +68,7 @@ public final class PlayerActivity extends Activity {
     private static final String PROGRESS_PREFS = "playback_progress";
 
     private ExoPlayer player;
+    private VideoFrameRateMatcher frameRateMatcher;
     private AdaptiveLoadControl adaptiveLoadControl;
     private MediaItem mediaItem;
     private TextView speedOverlay;
@@ -93,6 +102,9 @@ public final class PlayerActivity extends Activity {
     private long activePlaybackMs;
     private long lastOverlayTickMs;
     private long nextSpeedPollMs;
+    private long lastDiagnosticMs;
+    private int lastRenderedFrames;
+    private int lastDroppedFrames;
 
     private final Runnable overlayTick = new Runnable() {
         @Override public void run() {
@@ -113,6 +125,7 @@ public final class PlayerActivity extends Activity {
         @Override public void run() {
             if (!playbackStarted || player == null) return;
             saveProgress();
+            logPlaybackHealth();
             progressHandler.postDelayed(this, PROGRESS_SAVE_INTERVAL_MS);
         }
     };
@@ -165,7 +178,28 @@ public final class PlayerActivity extends Activity {
                         streamDataSource, new Ac3RechunkingExtractorsFactory()))
                 .build();
         view.setPlayer(player);
+        if (Build.VERSION.SDK_INT >= 30 && view.getVideoSurfaceView() instanceof SurfaceView) {
+            frameRateMatcher = new VideoFrameRateMatcher((SurfaceView) view.getVideoSurfaceView());
+            player.setVideoChangeFrameRateStrategy(C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_OFF);
+            player.setVideoFrameMetadataListener(frameRateMatcher);
+            player.addAnalyticsListener(new AnalyticsListener() {
+                @Override public void onVideoInputFormatChanged(EventTime eventTime,
+                        Format format, DecoderReuseEvaluation evaluation) {
+                    if (frameRateMatcher != null) frameRateMatcher.onVideoInputFormat(format);
+                }
+                @Override public void onAudioSinkError(EventTime eventTime, Exception error) {
+                    Log.e("PlaybackHealth", "Audio sink error", error);
+                }
+            });
+        }
         player.addListener(new Player.Listener() {
+            @Override public void onEvents(Player currentPlayer, Player.Events events) {
+                if (frameRateMatcher != null) {
+                    int playbackState = currentPlayer.getPlaybackState();
+                    frameRateMatcher.setPlaybackActive(currentPlayer.getPlayWhenReady()
+                            && playbackState != Player.STATE_IDLE && playbackState != Player.STATE_ENDED);
+                }
+            }
             @Override public void onPlayerError(PlaybackException error) {
                 if (!httpRangeRetryUsed && isHttpRangeError(error) && player != null) {
                     httpRangeRetryUsed = true;
@@ -221,9 +255,8 @@ public final class PlayerActivity extends Activity {
             List<MediaCodecInfo> available = new ArrayList<>(
                     MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, secure, tunneling));
             if ("video/mp4v-es".equals(mimeType)) {
-                // Prefer the Amlogic hardware path for old XVID/MPEG-4 Part 2.
-                // Software decoding on this 2 GB stick produces visible frame
-                // blending and cannot keep presentation timing stable.
+                // Prefer hardware decoding for old XVID/MPEG-4 Part 2; keep
+                // software codecs available if hardware initialization fails.
                 available.sort((left, right) ->
                         Boolean.compare(left.softwareOnly, right.softwareOnly));
             }
@@ -382,8 +415,32 @@ public final class PlayerActivity extends Activity {
                     : smoothedDownloadSpeed * 0.75 + bytesPerSecond * 0.25;
             adaptiveLoadControl.onDownloadSpeed(smoothedDownloadSpeed);
             checkInsufficientSpeed(smoothedDownloadSpeed);
-            if (overlayVisible) updateSpeedOverlay();
         });
+    }
+
+    private void logPlaybackHealth() {
+        if (player == null) return;
+        DecoderCounters counters = player.getVideoDecoderCounters();
+        if (counters == null) return;
+        counters.ensureUpdated();
+        long now = SystemClock.elapsedRealtime();
+        long elapsed = now - lastDiagnosticMs;
+        int rendered = counters.renderedOutputBufferCount;
+        int dropped = counters.droppedBufferCount;
+        Format format = player.getVideoFormat();
+        if (lastDiagnosticMs != 0 && elapsed > 0) {
+            Log.i("PlaybackHealth", String.format(Locale.US,
+                    "playing=%s positionMs=%d bufferMs=%d sourceFps=%.3f renderedFps=%.2f droppedDelta=%d droppedTotal=%d displayHz=%.3f",
+                    player.isPlaying(), player.getCurrentPosition(), player.getTotalBufferedDuration(),
+                    frameRateMatcher != null ? frameRateMatcher.getSourceFrameRate()
+                            : format == null ? -1f : format.frameRate,
+                    Math.max(0, rendered - lastRenderedFrames) * 1000.0 / elapsed,
+                    Math.max(0, dropped - lastDroppedFrames), dropped,
+                    getWindowManager().getDefaultDisplay().getRefreshRate()));
+        }
+        lastDiagnosticMs = now;
+        lastRenderedFrames = rendered;
+        lastDroppedFrames = dropped;
     }
 
     private void configureAdaptiveBuffer() {
@@ -397,8 +454,9 @@ public final class PlayerActivity extends Activity {
         long bufferedSeconds = Math.max(0, player.getTotalBufferedDuration() / 1_000);
         String target = adaptiveLoadControl == null ? ""
                 : " / " + adaptiveLoadControl.getTargetBufferSeconds() + " с";
-        speedOverlay.setText(formatSpeed(smoothedDownloadSpeed)
-                + "\nБуфер: " + bufferedSeconds + " с" + target);
+        String text = formatSpeed(smoothedDownloadSpeed)
+                + "\nБуфер: " + bufferedSeconds + " с" + target;
+        if (!text.contentEquals(speedOverlay.getText())) speedOverlay.setText(text);
     }
 
     private void checkInsufficientSpeed(double bytesPerSecond) {
@@ -456,6 +514,11 @@ public final class PlayerActivity extends Activity {
         saveProgress();
         progressHandler.removeCallbacksAndMessages(null);
         stopPlaybackMonitoring();
+        if (frameRateMatcher != null) {
+            if (player != null) player.clearVideoFrameMetadataListener(frameRateMatcher);
+            frameRateMatcher.release();
+            frameRateMatcher = null;
+        }
         if (player != null) { player.release(); player = null; }
         TorrServerClient.dropTorrentAsync(torrentHash);
         statsClient.destroy();
