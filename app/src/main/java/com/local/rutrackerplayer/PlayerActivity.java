@@ -2,6 +2,7 @@ package com.local.rutrackerplayer;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
@@ -22,8 +23,18 @@ import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.DefaultRenderersFactory;
+import androidx.media3.exoplayer.audio.AudioSink;
+import androidx.media3.exoplayer.audio.DefaultAudioSink;
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
+import androidx.media3.datasource.DefaultHttpDataSource;
+import androidx.media3.datasource.HttpDataSource;
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 import androidx.media3.ui.AspectRatioFrameLayout;
 import androidx.media3.ui.PlayerView;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 @OptIn(markerClass = UnstableApi.class)
@@ -31,11 +42,21 @@ public final class PlayerActivity extends Activity {
     static final String EXTRA_URL = "stream_url";
     static final String EXTRA_TITLE = "stream_title";
     static final String EXTRA_FILE_SIZE_BYTES = "stream_file_size_bytes";
+    static final String EXTRA_FILE_ID = "stream_file_id";
+    static final String EXTRA_FILE_PATH = "stream_file_path";
+    static final String EXTRA_TOPIC_ID = "topic_id";
+    static final String EXTRA_TOPIC_URL = "topic_url";
+    static final String EXTRA_FORUM = "topic_forum";
+    static final String EXTRA_RESULT_SIZE = "result_size";
+    static final String EXTRA_SEEDS = "result_seeds";
+    static final String EXTRA_START_POSITION_MS = "start_position_ms";
     private static final long SPEED_POLL_INTERVAL_MS = 1_000;
     private static final long OVERLAY_TICK_MS = 500;
     private static final long PROGRESS_SAVE_INTERVAL_MS = 5_000;
     private static final long MIN_RESUME_POSITION_MS = 15_000;
     private static final long COMPLETION_MARGIN_MS = 60_000;
+    private static final int STREAM_CONNECT_TIMEOUT_MS = 15_000;
+    private static final int STREAM_READ_TIMEOUT_MS = 120_000;
     private static final String PROGRESS_PREFS = "playback_progress";
 
     private ExoPlayer player;
@@ -48,13 +69,23 @@ public final class PlayerActivity extends Activity {
     private SharedPreferences progressPrefs;
     private String progressKey;
     private String torrentHash;
+    private String historyTitle;
+    private String topicUrl;
+    private String forum;
+    private String resultSize;
+    private String seeds;
+    private String selectedFilePath;
+    private long topicId;
+    private int selectedFileId;
     private long fileSizeBytes;
+    private long explicitStartPositionMs;
     private boolean playbackStarted;
     private boolean playbackCompleted;
     private boolean monitoringActive;
     private boolean overlayVisible;
     private boolean statsRequestInFlight;
     private boolean hasPlayedContent;
+    private boolean httpRangeRetryUsed;
     private boolean insufficientSpeedWarningShown;
     private int slowSpeedSamples;
     private int previousPlaybackState = Player.STATE_IDLE;
@@ -109,15 +140,45 @@ public final class PlayerActivity extends Activity {
         torrentHash = streamUri.getQueryParameter("link");
         fileSizeBytes = getIntent().getLongExtra(EXTRA_FILE_SIZE_BYTES, 0);
         String fileIndex = streamUri.getQueryParameter("index");
+        selectedFileId = getIntent().getIntExtra(EXTRA_FILE_ID,
+                fileIndex == null ? -1 : parseInt(fileIndex, -1));
+        selectedFilePath = safe(getIntent().getStringExtra(EXTRA_FILE_PATH));
+        topicId = getIntent().getLongExtra(EXTRA_TOPIC_ID, 0);
+        topicUrl = safe(getIntent().getStringExtra(EXTRA_TOPIC_URL));
+        forum = safe(getIntent().getStringExtra(EXTRA_FORUM));
+        resultSize = safe(getIntent().getStringExtra(EXTRA_RESULT_SIZE));
+        seeds = safe(getIntent().getStringExtra(EXTRA_SEEDS));
+        explicitStartPositionMs = Math.max(0,
+                getIntent().getLongExtra(EXTRA_START_POSITION_MS, 0));
         progressPrefs = getSharedPreferences(PROGRESS_PREFS, MODE_PRIVATE);
         String streamIdentity = torrentHash == null || torrentHash.isEmpty()
                 ? Integer.toHexString(url.hashCode()) : torrentHash;
         progressKey = streamIdentity + "_" + (fileIndex == null ? "0" : fileIndex);
         adaptiveLoadControl = new AdaptiveLoadControl();
-        player = new ExoPlayer.Builder(this).setLoadControl(adaptiveLoadControl).build();
+        DefaultHttpDataSource.Factory streamDataSource = new DefaultHttpDataSource.Factory()
+                .setConnectTimeoutMs(STREAM_CONNECT_TIMEOUT_MS)
+                .setReadTimeoutMs(STREAM_READ_TIMEOUT_MS)
+                .setAllowCrossProtocolRedirects(true);
+        player = new ExoPlayer.Builder(this, buildRenderersFactory(this))
+                .setLoadControl(adaptiveLoadControl)
+                .setMediaSourceFactory(new DefaultMediaSourceFactory(
+                        streamDataSource, new Ac3RechunkingExtractorsFactory()))
+                .build();
         view.setPlayer(player);
         player.addListener(new Player.Listener() {
             @Override public void onPlayerError(PlaybackException error) {
+                if (!httpRangeRetryUsed && isHttpRangeError(error) && player != null) {
+                    httpRangeRetryUsed = true;
+                    clearProgress();
+                    previousPlaybackState = Player.STATE_IDLE;
+                    player.stop();
+                    player.setMediaItem(mediaItem, 0);
+                    player.prepare();
+                    player.play();
+                    Toast.makeText(PlayerActivity.this,
+                            "Поток изменился — перезапускаю с начала", Toast.LENGTH_SHORT).show();
+                    return;
+                }
                 Toast.makeText(PlayerActivity.this, "Ошибка воспроизведения: " + error.getErrorCodeName(), Toast.LENGTH_LONG).show();
             }
 
@@ -127,7 +188,9 @@ public final class PlayerActivity extends Activity {
                     adaptiveLoadControl.onRebuffer();
                 }
                 if (playbackState == Player.STATE_READY) configureAdaptiveBuffer();
-                if (playbackState == Player.STATE_ENDED) {
+                if (playbackState == Player.STATE_ENDED && hasPlayedContent) {
+                    long duration = player == null ? 0 : Math.max(0, player.getDuration());
+                    saveHistory(duration, duration, true);
                     playbackCompleted = true;
                     clearProgress();
                 }
@@ -138,11 +201,58 @@ public final class PlayerActivity extends Activity {
                 if (isPlaying) hasPlayedContent = true;
             }
         });
-        String title = getIntent().getStringExtra(EXTRA_TITLE);
-        mediaItem = new MediaItem.Builder().setUri(url).setMediaId(title == null ? "RuTracker" : title).build();
-        long savedPosition = savedPosition();
+        historyTitle = safe(getIntent().getStringExtra(EXTRA_TITLE));
+        String mediaTitle = historyTitle.isEmpty() ? "RuTracker" : historyTitle;
+        mediaItem = new MediaItem.Builder().setUri(url).setMediaId(mediaTitle).build();
+        long savedPosition = Math.max(savedPosition(), explicitStartPositionMs);
         if (savedPosition >= MIN_RESUME_POSITION_MS) showResumeDialog(savedPosition);
         else beginPlayback(0);
+    }
+
+    private static String safe(String value) { return value == null ? "" : value; }
+
+    private static int parseInt(String value, int fallback) {
+        try { return Integer.parseInt(value); }
+        catch (Throwable ignored) { return fallback; }
+    }
+
+    private static DefaultRenderersFactory buildRenderersFactory(Context context) {
+        MediaCodecSelector selector = (mimeType, secure, tunneling) -> {
+            List<MediaCodecInfo> available = new ArrayList<>(
+                    MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, secure, tunneling));
+            if ("video/mp4v-es".equals(mimeType)) {
+                // Prefer the Amlogic hardware path for old XVID/MPEG-4 Part 2.
+                // Software decoding on this 2 GB stick produces visible frame
+                // blending and cannot keep presentation timing stable.
+                available.sort((left, right) ->
+                        Boolean.compare(left.softwareOnly, right.softwareOnly));
+            }
+            return available;
+        };
+        return new DefaultRenderersFactory(context) {
+            @Override protected AudioSink buildAudioSink(Context sinkContext,
+                    boolean enableFloatOutput, boolean enablePlaybackParams) {
+                // This firmware's c2.amlogic AC3 decoder crashes on older AVI
+                // tracks. The context-aware sink uses the TV/HDMI capabilities,
+                // allowing supported AC3 tracks to bypass that broken decoder.
+                return new DefaultAudioSink.Builder(sinkContext)
+                        .setEnableFloatOutput(enableFloatOutput)
+                        .setEnableAudioTrackPlaybackParams(enablePlaybackParams)
+                        .build();
+            }
+        }.setMediaCodecSelector(selector).setEnableDecoderFallback(true);
+    }
+
+    private static boolean isHttpRangeError(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof HttpDataSource.InvalidResponseCodeException
+                    && ((HttpDataSource.InvalidResponseCodeException) current).responseCode == 416) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     private void beginPlayback(long startPositionMs) {
@@ -192,12 +302,25 @@ public final class PlayerActivity extends Activity {
         long duration = player.getDuration();
         if (duration > 0 && duration - position <= COMPLETION_MARGIN_MS) {
             clearProgress();
+            if (hasPlayedContent) saveHistory(duration, duration, true);
+            playbackCompleted = true;
             return;
         }
         if (position < MIN_RESUME_POSITION_MS) return;
         SharedPreferences.Editor editor = progressPrefs.edit().putLong(positionKey(), position);
         if (duration > 0) editor.putLong(durationKey(), duration);
         editor.apply();
+        if (hasPlayedContent) saveHistory(position, duration, false);
+    }
+
+    private void saveHistory(long positionMs, long durationMs, boolean completed) {
+        if (activePlaybackMs < MIN_RESUME_POSITION_MS) return;
+        if (positionMs < MIN_RESUME_POSITION_MS && !completed) return;
+        String key = PlaybackHistory.makeKey(topicId, selectedFilePath, torrentHash, selectedFileId);
+        PlaybackHistory.upsert(this, new PlaybackHistory.Entry(
+                key, progressKey, topicId, historyTitle, topicUrl, forum, resultSize, seeds,
+                torrentHash, selectedFileId, selectedFilePath, fileSizeBytes,
+                positionMs, durationMs, System.currentTimeMillis(), completed));
     }
 
     private void clearProgress() {

@@ -30,6 +30,10 @@ public final class RutrackerWebClient {
     private final TorrentFetcher torrentFetcher;
     private long pendingTopicId = -1;
     private long topicRequestGeneration;
+    private long searchRequestGeneration;
+    private long pendingSearchGeneration = -1;
+    private String pendingSearchQuery = "";
+    private boolean destroyed;
 
     @SuppressLint("SetJavaScriptEnabled")
     public RutrackerWebClient(Activity activity, WebView webView, String forumBase, RutrackerCallback callback) {
@@ -60,7 +64,7 @@ public final class RutrackerWebClient {
     }
 
     public void openLogin() {
-        cancelPendingTopic();
+        cancelPending();
         webView.loadUrl(forumBase + "login.php");
         webView.requestFocus();
     }
@@ -72,7 +76,9 @@ public final class RutrackerWebClient {
             return;
         }
         try {
-            cancelPendingTopic();
+            cancelPending();
+            pendingSearchGeneration = ++searchRequestGeneration;
+            pendingSearchQuery = cleaned;
             webView.loadUrl(forumBase + "tracker.php?nm=" + URLEncoder.encode(cleaned, "UTF-8"));
         } catch (Exception e) {
             callback.onError("Не удалось сформировать поисковый запрос", e);
@@ -90,22 +96,34 @@ public final class RutrackerWebClient {
     }
 
     public void destroy() {
-        cancelPendingTopic();
+        destroyed = true;
+        cancelPending();
         torrentFetcher.destroy();
         webView.stopLoading();
         webView.setDownloadListener(null);
         webView.setWebViewClient(null);
     }
 
+    /** Invalidates topic extraction and any authenticated torrent download in flight. */
+    public void cancelPending() {
+        searchRequestGeneration++;
+        pendingSearchGeneration = -1;
+        pendingSearchQuery = "";
+        cancelPendingTopic();
+        torrentFetcher.cancelPending();
+    }
+
     private final class Client extends WebViewClient {
         @Override public void onPageStarted(WebView view, String url, Bitmap favicon) {
+            if (destroyed) return;
             callback.onPageState(url, true);
         }
 
         @Override public void onPageFinished(WebView view, String url) {
+            if (destroyed) return;
             callback.onPageState(url, false);
             if (policy.isLoginUrl(url)) callback.onLoginPageShown();
-            if (policy.isSearchUrl(url)) extractSearchResults();
+            if (policy.isSearchUrl(url)) extractSearchResults(url, pendingSearchGeneration);
             Uri parsed = Uri.parse(url);
             String path = parsed.getPath();
             if (policy.isAllowedHttps(url) && path != null && path.endsWith("/viewtopic.php")) {
@@ -122,6 +140,7 @@ public final class RutrackerWebClient {
         }
 
         private boolean handleNavigation(String url) {
+            if (destroyed) return true;
             if (url != null && url.startsWith("magnet:?")) {
                 cancelPendingTopic();
                 callback.onTopicMagnet(-1, "", url);
@@ -142,11 +161,12 @@ public final class RutrackerWebClient {
 
         @Override public void onSafeBrowsingHit(WebView view, WebResourceRequest request, int threatType, SafeBrowsingResponse response) {
             response.backToSafety(true);
-            callback.onError("WebView заблокировал небезопасную страницу", null);
+            if (!destroyed) callback.onError("WebView заблокировал небезопасную страницу", null);
         }
     }
 
-    private void extractSearchResults() {
+    private void extractSearchResults(String pageUrl, long generation) {
+        if (!isPendingSearch(pageUrl, generation)) return;
         String script = "(function(){const seen=new Set(),out=[];"
                 // Real tracker rows use the tLink class. The broader viewtopic
                 // selector also matches announcements and navigation links.
@@ -161,6 +181,7 @@ public final class RutrackerWebClient {
                 + "if(out.length>=100)break;}catch(e){}}return JSON.stringify(out);})()";
         webView.evaluateJavascript(script, value -> {
             try {
+                if (!isPendingSearch(pageUrl, generation)) return;
                 Object decoded = new JSONTokener(value).nextValue();
                 if (!(decoded instanceof String)) return;
                 JSONArray array = new JSONArray((String) decoded);
@@ -173,11 +194,19 @@ public final class RutrackerWebClient {
                     results.add(new SearchResult(id, item.optString("title"), item.optString("url"),
                             item.optString("forum"), item.optString("size"), item.optString("seeds")));
                 }
-                callback.onSearchResults(results);
+                if (isPendingSearch(pageUrl, generation)) callback.onSearchResults(results);
             } catch (Throwable e) {
-                callback.onError("Не удалось разобрать результаты поиска", e);
+                if (isPendingSearch(pageUrl, generation)) {
+                    callback.onError("Не удалось разобрать результаты поиска", e);
+                }
             }
         });
+    }
+
+    private boolean isPendingSearch(String pageUrl, long generation) {
+        return !destroyed && generation >= 0 && generation == pendingSearchGeneration
+                && generation == searchRequestGeneration
+                && pendingSearchQuery.equals(Uri.parse(pageUrl).getQueryParameter("nm"));
     }
 
     private void extractTopicSource(String pageUrl) {

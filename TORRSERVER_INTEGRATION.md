@@ -1,14 +1,15 @@
 # TorrServer / TorrServe integration notes
 
 Checked against the official upstream repositories and release metadata on
-2026-10-31. No software from this note was installed on the TV stick.
+2026-11-02, then validated on the Xiaomi TV Stick 4K with TorrServe Client 143
+and TorrServer MatriX 147.
 
 ## Compatible official artifacts
 
 The stick reports `armeabi-v7a`, so the matching server artifact is
 `TorrServer-android-arm7`.
 
-| Component | Official release | Size | SHA-256 |
+| Component | Verified compatible release | Size | SHA-256 |
 |---|---:|---:|---|
 | TorrServer Android ARMv7 | `MatriX.147.2` | 63,974,812 bytes | `be10bc7d073487fafc8d076774c4dabf517d13740f8c638aac920093fd7898cc` |
 | TorrServe Android client | `MatriX.143.Client` | 11,955,914 bytes | `4b577862df6de9b22c387fd2737818a8373b9efa354c91badcc6b78f73f7c7a9` |
@@ -17,6 +18,7 @@ Links:
 
 - Server release: <https://github.com/YouROK/TorrServer/releases/tag/MatriX.147.2>
 - Server binary: <https://github.com/YouROK/TorrServer/releases/download/MatriX.147.2/TorrServer-android-arm7>
+- Current upstream server release (not yet device-tested here): <https://github.com/YouROK/TorrServer/releases/tag/MatriX.148>
 - Android client release: <https://github.com/YouROK/TorrServe/releases/tag/MatriX.143.Client>
 - Android client APK: <https://github.com/YouROK/TorrServe/releases/download/MatriX.143.Client/TorrServe_MatriX.143.Client.apk>
 
@@ -28,10 +30,12 @@ fix from [issue #130](https://github.com/YouROK/TorrServe/issues/130): explicit
 data-sync/media-playback foreground-service types, wake-lock/battery permissions,
 and `stopWithTask=false`.
 
-Important: TorrServe's current update manifest still points to `MatriX.147`,
-not the newer `147.2` patch. “Update server from network” is therefore the
-easiest route, but “Update server from file” with the verified `147.2` ARM7
-binary is the current upstream release route.
+`MatriX.148` is the current upstream server release, but this project has only
+device-tested MatriX 147 and verified the 147.2 ARM7 artifact. During the
+2026-10-31 device check, TorrServe's network updater installed/reported
+MatriX 147. Prefer the client's network updater for its supported path, or use
+“Update server from file” only when deliberately pinning the known-compatible
+147.2 ARM7 binary. Do not treat the untested 148 release as a required upgrade.
 
 ## Recommended installation arrangement
 
@@ -108,8 +112,10 @@ Content-Type: application/json
 {"action":"get","hash":"<infohash>"}
 ```
 
-Select a video entry from `file_stats` (for a single-film release, normally the
-largest playable video), then give Media3/ExoPlayer one of these URLs:
+Collect the recognised video entries from `file_stats`. A single-film release
+can start immediately; for a multi-file release, show the files in torrent
+order and let the user select the episode or video before giving
+Media3/ExoPlayer one of these URLs:
 
 ```text
 http://127.0.0.1:8090/play/<infohash>/<file-id>
@@ -117,7 +123,11 @@ http://127.0.0.1:8090/stream/<urlencoded-filename>?link=<infohash>&index=<file-i
 ```
 
 The second form is what the official Android client generates. TorrServer
-supports HTTP range requests through these endpoints. A modern custom Android
+supports HTTP range requests through these endpoints. Do not add `&preload` to
+the player URL: on MatriX 147 that query runs the configured preload
+synchronously before the stream handler responds, which can exceed a media
+client's response timeout on a slow swarm. Let the player read the stream
+directly and manage its own forward buffer instead. A modern custom Android
 app must explicitly permit cleartext HTTP to localhost in its network security
 configuration.
 

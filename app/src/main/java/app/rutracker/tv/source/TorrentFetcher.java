@@ -14,10 +14,11 @@ import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 final class TorrentFetcher {
     private static final int MAX_REDIRECTS = 5;
@@ -30,7 +31,9 @@ final class TorrentFetcher {
     private final String userAgent;
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final Set<Long> inFlightTopics = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<Long, Integer> inFlightTopics = new ConcurrentHashMap<>();
+    private final AtomicInteger operationGeneration = new AtomicInteger();
+    private volatile boolean destroyed;
 
     TorrentFetcher(Context context, RutrackerUrlPolicy policy, RutrackerCallback callback, String userAgent) {
         appContext = context.getApplicationContext();
@@ -44,28 +47,56 @@ final class TorrentFetcher {
     void fetch(String initialUrl, String refererUrl) {
         final long topicId = policy.topicId(initialUrl);
         if (!policy.isTorrentDownloadUrl(initialUrl) || topicId <= 0) {
-            callback.onError("Недопустимая ссылка на torrent-файл", null);
+            if (!destroyed) callback.onError("Недопустимая ссылка на torrent-файл", null);
             return;
         }
-        if (!inFlightTopics.add(topicId)) return;
+        final int operation;
+        synchronized (this) {
+            if (destroyed || inFlightTopics.containsKey(topicId)) return;
+            operation = operationGeneration.incrementAndGet();
+            inFlightTopics.put(topicId, operation);
+        }
         CookieManager.getInstance().flush();
-        executor.execute(() -> {
-            try {
-                File result = fetchBlocking(initialUrl, topicId, refererUrl);
-                main.post(() -> callback.onTorrentFile(topicId, result));
-            } catch (AuthenticationRequired e) {
-                main.post(callback::onAuthenticationRequired);
-            } catch (Throwable e) {
-                main.post(() -> callback.onError("Не удалось получить torrent-файл", e));
-            } finally {
-                inFlightTopics.remove(topicId);
-            }
-        });
+        try {
+            executor.execute(() -> {
+                try {
+                    File result = fetchBlocking(initialUrl, topicId, refererUrl, operation);
+                    if (!isActive(operation)) {
+                        //noinspection ResultOfMethodCallIgnored
+                        result.delete();
+                        return;
+                    }
+                    main.post(() -> {
+                        if (isActive(operation)) callback.onTorrentFile(topicId, result);
+                        else {
+                            //noinspection ResultOfMethodCallIgnored
+                            result.delete();
+                        }
+                    });
+                } catch (AuthenticationRequired e) {
+                    main.post(() -> {
+                        if (isActive(operation)) callback.onAuthenticationRequired();
+                    });
+                } catch (Throwable e) {
+                    main.post(() -> {
+                        if (isActive(operation)) {
+                            callback.onError("Не удалось получить torrent-файл", e);
+                        }
+                    });
+                } finally {
+                    inFlightTopics.remove(topicId, operation);
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            inFlightTopics.remove(topicId, operation);
+        }
     }
 
-    private File fetchBlocking(String initialUrl, long topicId, String refererUrl) throws Exception {
+    private File fetchBlocking(String initialUrl, long topicId, String refererUrl, int operation)
+            throws Exception {
         String current = initialUrl;
         for (int redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
+            if (!isActive(operation)) throw new IOException("Cancelled");
             if (!policy.isAllowedHttps(current)) throw new IOException("Redirect left allowed host");
             HttpURLConnection connection = (HttpURLConnection) new URL(current).openConnection();
             connection.setInstanceFollowRedirects(false);
@@ -103,6 +134,7 @@ final class TorrentFetcher {
                 int total = 0;
                 int read;
                 while ((read = input.read(buffer)) != -1) {
+                    if (!isActive(operation)) throw new IOException("Cancelled");
                     total += read;
                     if (total > MAX_BYTES) throw new IOException("Torrent too large");
                     file.write(buffer, 0, read);
@@ -157,6 +189,19 @@ final class TorrentFetcher {
         throw new IOException("Server did not return a torrent file");
     }
 
-    void destroy() { executor.shutdownNow(); }
+    synchronized void cancelPending() {
+        operationGeneration.incrementAndGet();
+        inFlightTopics.clear();
+    }
+
+    private boolean isActive(int operation) {
+        return !destroyed && operationGeneration.get() == operation;
+    }
+
+    void destroy() {
+        destroyed = true;
+        cancelPending();
+        executor.shutdownNow();
+    }
     private static final class AuthenticationRequired extends IOException {}
 }

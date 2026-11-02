@@ -28,7 +28,9 @@ import app.rutracker.tv.source.SearchResult;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.File;
+import java.text.DateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -50,7 +52,8 @@ public final class MainActivity extends Activity implements RutrackerCallback {
     private final TorrServerClient torrServer = new TorrServerClient();
     private final List<SearchResult> currentResults = new ArrayList<>();
     private final Map<Long, SearchResult> favorites = new LinkedHashMap<>();
-    private SearchResult selected;
+    private PendingPlayback pendingPlayback;
+    private String pendingPreparedHash = "";
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -97,6 +100,8 @@ public final class MainActivity extends Activity implements RutrackerCallback {
         toolbar.addView(search, buttonParams());
         Button favoritesButton = button("Избранное");
         toolbar.addView(favoritesButton, buttonParams());
+        Button historyButton = button("История");
+        toolbar.addView(historyButton, buttonParams());
         loginButton = button("Войти");
         toolbar.addView(loginButton, buttonParams());
         root.addView(toolbar, new LinearLayout.LayoutParams(-1, -2));
@@ -134,11 +139,17 @@ public final class MainActivity extends Activity implements RutrackerCallback {
             return false;
         });
         favoritesButton.setOnClickListener(v -> {
+            cancelPendingPlayback();
             currentResults.clear();
             currentResults.addAll(favorites.values());
             showResults(currentResults, "Избранное");
         });
+        historyButton.setOnClickListener(v -> {
+            cancelPendingPlayback();
+            showHistory();
+        });
         loginButton.setOnClickListener(v -> {
+            cancelPendingPlayback();
             if (webView.getVisibility() == View.VISIBLE) showResults(currentResults, "Результаты");
             else { showWeb(); status.setText("Введите логин и пароль на странице RuTracker"); rutracker.openLogin(); }
         });
@@ -147,6 +158,7 @@ public final class MainActivity extends Activity implements RutrackerCallback {
     private void doSearch() {
         String text = query.getText().toString().trim();
         if (text.isEmpty()) { status.setText("Введите название фильма"); query.requestFocus(); return; }
+        cancelPendingPlayback();
         // Keep WebView visible while loading. RuTracker may show a Cloudflare
         // browser check that needs to be rendered before the search page opens.
         // The results callback switches back to the native TV list.
@@ -224,10 +236,25 @@ public final class MainActivity extends Activity implements RutrackerCallback {
     }
 
     private void startPlay(SearchResult item) {
-        selected = item;
+        startPlay(item, "", 0);
+    }
+
+    private void startPlay(SearchResult item, String preferredFilePath, long startPositionMs) {
+        cancelPendingPlayback();
+        pendingPlayback = new PendingPlayback(item, preferredFilePath, startPositionMs);
         hideWeb();
         status.setText("Получаю авторизованный .torrent-файл…");
         rutracker.openTopic(item.topicId);
+    }
+
+    private void cancelPendingPlayback() {
+        pendingPlayback = null;
+        if (!pendingPreparedHash.isEmpty()) {
+            TorrServerClient.dropTorrentAsync(pendingPreparedHash);
+            pendingPreparedHash = "";
+        }
+        torrServer.cancelPendingPreparation();
+        if (rutracker != null) rutracker.cancelPending();
     }
 
     private CharSequence format(SearchResult item) {
@@ -328,28 +355,205 @@ public final class MainActivity extends Activity implements RutrackerCallback {
     }
 
     @Override public void onTopicMagnet(long topicId, String title, String magnetUri) {
-        String selectedTitle = selected != null ? selected.title : title;
-        torrServer.prepareMagnet(magnetUri, selectedTitle, playerCallback(selectedTitle));
+        PendingPlayback request = pendingPlayback;
+        if (request == null || request.item.topicId != topicId) return;
+        torrServer.prepareMagnet(magnetUri, request.item.title, playerCallback(request));
     }
 
     @Override public void onTorrentFile(long topicId, File torrentFile) {
-        String selectedTitle = selected == null ? "RuTracker" : selected.title;
-        torrServer.prepareTorrent(torrentFile, selectedTitle, playerCallback(selectedTitle));
+        PendingPlayback request = pendingPlayback;
+        if (request == null || request.item.topicId != topicId) {
+            // A slow response for a previously selected topic must never be
+            // prepared or labelled as the user's newer selection.
+            //noinspection ResultOfMethodCallIgnored
+            torrentFile.delete();
+            return;
+        }
+        torrServer.prepareTorrent(torrentFile, request.item.title, playerCallback(request));
     }
 
-    private TorrServerClient.Callback playerCallback(String title) {
+    private TorrServerClient.Callback playerCallback(PendingPlayback request) {
         return new TorrServerClient.Callback() {
-            @Override public void onProgress(String message) { status.setText(message); }
-            @Override public void onReady(String streamUrl, String fileName, long fileSizeBytes) {
-                status.setText("Запускаю: " + fileName);
-                Intent intent = new Intent(MainActivity.this, PlayerActivity.class);
-                intent.putExtra(PlayerActivity.EXTRA_URL, streamUrl);
-                intent.putExtra(PlayerActivity.EXTRA_TITLE, title);
-                intent.putExtra(PlayerActivity.EXTRA_FILE_SIZE_BYTES, fileSizeBytes);
-                startActivity(intent);
+            @Override public void onProgress(String message) {
+                if (pendingPlayback == request) status.setText(message);
             }
-            @Override public void onError(String message, Throwable cause) { status.setText(message); }
+            @Override public void onFilesReady(String hash, List<TorrentFile> files) {
+                if (pendingPlayback != request) {
+                    TorrServerClient.dropTorrentAsync(hash);
+                    return;
+                }
+                TorrentFile preferred = findPreferred(files, request.preferredFilePath);
+                if (preferred != null) {
+                    launchPlayer(request, hash, preferred);
+                } else if (files.size() == 1) {
+                    launchPlayer(request, hash, files.get(0));
+                } else {
+                    showEpisodeChooser(request, hash, files);
+                }
+            }
+            @Override public void onError(String message, Throwable cause) {
+                if (pendingPlayback == request) {
+                    pendingPlayback = null;
+                    status.setText(message);
+                }
+            }
         };
+    }
+
+    private static TorrentFile findPreferred(List<TorrentFile> files, String preferredPath) {
+        if (preferredPath == null || preferredPath.isEmpty()) return null;
+        for (TorrentFile file : files) {
+            if (preferredPath.equals(file.path)) return file;
+        }
+        return null;
+    }
+
+    private void showEpisodeChooser(PendingPlayback request, String hash,
+            List<TorrentFile> files) {
+        pendingPreparedHash = hash;
+        String[] labels = new String[files.size()];
+        for (int i = 0; i < files.size(); i++) {
+            TorrentFile file = files.get(i);
+            labels[i] = file.path + "\n" + formatBytes(file.lengthBytes);
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Выберите серию или видеофайл")
+                .setItems(labels, (ignored, which) -> launchPlayer(request, hash, files.get(which)))
+                .setNegativeButton("Отмена", null)
+                .setOnCancelListener(ignored -> cancelPreparedTorrent(request, hash))
+                .create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
+                cancelPreparedTorrent(request, hash);
+                dialog.dismiss();
+            });
+            if (dialog.getListView() != null) {
+                dialog.getListView().setSelection(0);
+                dialog.getListView().requestFocus();
+            }
+        });
+        dialog.show();
+    }
+
+    private void cancelPreparedTorrent(PendingPlayback request, String hash) {
+        if (pendingPlayback == request) pendingPlayback = null;
+        if (hash.equals(pendingPreparedHash)) pendingPreparedHash = "";
+        TorrServerClient.dropTorrentAsync(hash);
+        status.setText("Выбор серии отменён");
+    }
+
+    private void launchPlayer(PendingPlayback request, String hash, TorrentFile file) {
+        if (pendingPlayback != request) {
+            TorrServerClient.dropTorrentAsync(hash);
+            return;
+        }
+        pendingPlayback = null;
+        if (hash.equals(pendingPreparedHash)) pendingPreparedHash = "";
+        SearchResult item = request.item;
+        status.setText("Запускаю: " + file.fileName());
+        Intent intent = new Intent(MainActivity.this, PlayerActivity.class);
+        intent.putExtra(PlayerActivity.EXTRA_URL, TorrServerClient.buildStreamUrl(hash, file));
+        intent.putExtra(PlayerActivity.EXTRA_TITLE, item.title);
+        intent.putExtra(PlayerActivity.EXTRA_FILE_SIZE_BYTES, file.lengthBytes);
+        intent.putExtra(PlayerActivity.EXTRA_FILE_ID, file.id);
+        intent.putExtra(PlayerActivity.EXTRA_FILE_PATH, file.path);
+        intent.putExtra(PlayerActivity.EXTRA_TOPIC_ID, item.topicId);
+        intent.putExtra(PlayerActivity.EXTRA_TOPIC_URL, item.topicUrl);
+        intent.putExtra(PlayerActivity.EXTRA_FORUM, item.forum);
+        intent.putExtra(PlayerActivity.EXTRA_RESULT_SIZE, item.size);
+        intent.putExtra(PlayerActivity.EXTRA_SEEDS, item.seeds);
+        intent.putExtra(PlayerActivity.EXTRA_START_POSITION_MS, request.startPositionMs);
+        startActivity(intent);
+    }
+
+    private void showHistory() {
+        hideWeb();
+        List<PlaybackHistory.Entry> history = PlaybackHistory.list(this);
+        results.removeAllViews();
+        TextView title = new TextView(this);
+        title.setText("История  •  " + history.size());
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(20);
+        title.setPadding(dp(4), dp(4), dp(4), dp(10));
+        results.addView(title);
+        if (history.isEmpty()) {
+            showMessage("История пока пуста. Здесь появятся видео, просмотренные не менее 15 секунд.");
+            return;
+        }
+        Button first = null;
+        for (PlaybackHistory.Entry entry : history) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            Button open = button(formatHistory(entry));
+            open.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            open.setTextSize(15);
+            open.setMinHeight(dp(88));
+            open.setOnClickListener(v -> playHistory(entry));
+            LinearLayout.LayoutParams openParams = new LinearLayout.LayoutParams(0, -2, 1f);
+            openParams.setMargins(0, 0, dp(8), dp(8));
+            row.addView(open, openParams);
+            Button remove = button("×");
+            remove.setContentDescription("Удалить из истории");
+            remove.setOnClickListener(v -> {
+                PlaybackHistory.remove(this, entry.key);
+                if (!entry.progressKey.isEmpty()) {
+                    getSharedPreferences("playback_progress", MODE_PRIVATE).edit()
+                            .remove(entry.progressKey + ".position")
+                            .remove(entry.progressKey + ".duration")
+                            .apply();
+                }
+                showHistory();
+            });
+            LinearLayout.LayoutParams removeParams = new LinearLayout.LayoutParams(dp(70), dp(88));
+            removeParams.setMargins(0, 0, 0, dp(8));
+            row.addView(remove, removeParams);
+            results.addView(row, new LinearLayout.LayoutParams(-1, -2));
+            if (first == null) first = open;
+        }
+        if (first != null) first.requestFocus();
+    }
+
+    private void playHistory(PlaybackHistory.Entry entry) {
+        if (entry.topicId <= 0) {
+            status.setText("Эту запись нельзя открыть повторно: нет ссылки на тему RuTracker");
+            return;
+        }
+        SearchResult item = new SearchResult(entry.topicId, entry.title, entry.topicUrl,
+                entry.forum, entry.resultSize, entry.seeds);
+        long position = entry.completed ? 0 : entry.positionMs;
+        startPlay(item, entry.filePath, position);
+    }
+
+    private static String formatHistory(PlaybackHistory.Entry entry) {
+        String file = entry.filePath;
+        int slash = file.lastIndexOf('/');
+        if (slash >= 0) file = file.substring(slash + 1);
+        String progress = entry.completed ? "Просмотрено"
+                : "Продолжить: " + formatTime(entry.positionMs)
+                        + (entry.durationMs > 0 ? " / " + formatTime(entry.durationMs) : "");
+        String date = entry.updatedAtMs > 0
+                ? DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+                        .format(new Date(entry.updatedAtMs)) : "";
+        return progress + (date.isEmpty() ? "" : "  •  " + date)
+                + "\n" + entry.title + (file.isEmpty() ? "" : "\n" + file);
+    }
+
+    private static String formatTime(long timeMs) {
+        long totalSeconds = Math.max(0, timeMs / 1000);
+        long hours = totalSeconds / 3600;
+        long minutes = (totalSeconds % 3600) / 60;
+        long seconds = totalSeconds % 60;
+        return hours > 0
+                ? String.format(java.util.Locale.getDefault(), "%d:%02d:%02d", hours, minutes, seconds)
+                : String.format(java.util.Locale.getDefault(), "%d:%02d", minutes, seconds);
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes >= 1024L * 1024 * 1024) {
+            return String.format(java.util.Locale.getDefault(), "%.2f ГБ", bytes / (1024d * 1024 * 1024));
+        }
+        return String.format(java.util.Locale.getDefault(), "%.0f МБ", bytes / (1024d * 1024));
     }
 
     @Override public void onAuthenticationRequired() {
@@ -388,12 +592,29 @@ public final class MainActivity extends Activity implements RutrackerCallback {
         getSharedPreferences("favorites", MODE_PRIVATE).edit().putString("items", array.toString()).apply();
     }
 
+    private static final class PendingPlayback {
+        final SearchResult item;
+        final String preferredFilePath;
+        final long startPositionMs;
+
+        PendingPlayback(SearchResult item, String preferredFilePath, long startPositionMs) {
+            this.item = item;
+            this.preferredFilePath = preferredFilePath == null ? "" : preferredFilePath;
+            this.startPositionMs = Math.max(0, startPositionMs);
+        }
+    }
+
     @Override public void onBackPressed() {
-        if (webView.getVisibility() == View.VISIBLE) { showResults(currentResults, "Результаты"); return; }
+        if (webView.getVisibility() == View.VISIBLE) {
+            cancelPendingPlayback();
+            showResults(currentResults, "Результаты");
+            return;
+        }
         super.onBackPressed();
     }
 
     @Override protected void onDestroy() {
+        cancelPendingPlayback();
         if (rutracker != null) rutracker.destroy();
         torrServer.destroy();
         webView.destroy();

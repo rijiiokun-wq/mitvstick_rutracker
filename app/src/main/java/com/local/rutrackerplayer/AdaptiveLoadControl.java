@@ -14,9 +14,9 @@ final class AdaptiveLoadControl extends DefaultLoadControl {
     private static final int ALLOCATION_SIZE = 64 * 1024;
     private static final int MAX_BUFFER_MS = 180_000;
     private static final int[] TARGET_BUFFER_MS = {45_000, 75_000, 120_000};
-    private static final int[] START_BUFFER_MS = {12_000, 15_000, 18_000};
-    private static final int[] REBUFFER_MS = {20_000, 28_000, 40_000};
-    private static final int[] TARGET_BUFFER_BYTES = {128 * MIB, 144 * MIB, 160 * MIB};
+    private static final int[] START_BUFFER_MS = {20_000, 30_000, 45_000};
+    private static final int[] REBUFFER_MS = {30_000, 60_000, 90_000};
+    private static final int[] TARGET_BUFFER_BYTES = {96 * MIB, 112 * MIB, 128 * MIB};
     private static final long SPEED_INCREASE_COOLDOWN_MS = 30_000;
 
     private final DefaultAllocator allocator;
@@ -35,9 +35,14 @@ final class AdaptiveLoadControl extends DefaultLoadControl {
                 allocator,
                 MAX_BUFFER_MS,
                 MAX_BUFFER_MS,
+                MAX_BUFFER_MS,
+                MAX_BUFFER_MS,
+                START_BUFFER_MS[0],
                 START_BUFFER_MS[0],
                 REBUFFER_MS[0],
+                REBUFFER_MS[0],
                 TARGET_BUFFER_BYTES[TARGET_BUFFER_BYTES.length - 1],
+                false,
                 false,
                 0,
                 false);

@@ -6,7 +6,8 @@ def speedOverlayTimeoutMs = (project.findProperty('speedOverlayTimeoutMs') ?: '6
 
 android {
     namespace 'com.local.rutrackerplayer'
-    compileSdk 34
+    compileSdk 36
+    buildToolsVersion '36.0.0'
 
     buildFeatures {
         buildConfig true
@@ -16,8 +17,8 @@ android {
         applicationId 'com.local.rutrackerplayer'
         minSdk 28
         targetSdk 34
-        versionCode 9
-        versionName '0.2.7'
+        versionCode 10
+        versionName '0.3.0'
         buildConfigField 'long', 'SPEED_OVERLAY_TIMEOUT_MS', "${speedOverlayTimeoutMs}L"
     }
 
@@ -35,6 +36,6 @@ android {
 }
 
 dependencies {
-    implementation 'androidx.media3:media3-exoplayer:1.4.1'
-    implementation 'androidx.media3:media3-ui:1.4.1'
+    implementation 'androidx.media3:media3-exoplayer:1.11.1'
+    implementation 'androidx.media3:media3-ui:1.11.1'
 }

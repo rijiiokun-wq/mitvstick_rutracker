@@ -15,15 +15,18 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.util.Locale;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 final class TorrServerClient {
     interface Callback {
         void onProgress(String message);
-        void onReady(String streamUrl, String fileName, long fileSizeBytes);
+        void onFilesReady(String hash, List<TorrentFile> files);
         void onError(String message, Throwable cause);
     }
 
@@ -37,9 +40,12 @@ final class TorrServerClient {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicInteger operationGeneration = new AtomicInteger();
     private volatile boolean destroyed;
+    private String lastSpeedHash = "";
+    private long lastUsefulBytes = -1;
+    private long lastSpeedSampleMs;
 
     void check(HealthCallback callback) {
-        executor.execute(() -> {
+        submit(() -> {
             try {
                 String version = get("/echo", 2500);
                 main.post(() -> { if (!destroyed) callback.onResult(true, version.trim()); });
@@ -54,13 +60,26 @@ final class TorrServerClient {
             main.post(() -> { if (!destroyed) callback.onResult(-1); });
             return;
         }
-        executor.execute(() -> {
+        submit(() -> {
             double speed = -1;
             try {
                 JSONObject request = new JSONObject();
                 request.put("action", "get");
                 request.put("hash", hash);
-                speed = postJson("/torrents", request).optDouble("download_speed", -1);
+                JSONObject status = postJson("/torrents", request);
+                speed = status.optDouble("download_speed", -1);
+                if (speed < 0) {
+                    long usefulBytes = status.optLong("bytes_read_useful_data", -1);
+                    long now = SystemClock.elapsedRealtime();
+                    if (hash.equals(lastSpeedHash) && lastUsefulBytes >= 0
+                            && usefulBytes >= lastUsefulBytes && now > lastSpeedSampleMs) {
+                        speed = (usefulBytes - lastUsefulBytes) * 1000.0
+                                / (now - lastSpeedSampleMs);
+                    }
+                    lastSpeedHash = hash;
+                    lastUsefulBytes = usefulBytes;
+                    lastSpeedSampleMs = now;
+                }
             } catch (Throwable ignored) {}
             final double result = speed;
             main.post(() -> { if (!destroyed) callback.onResult(result); });
@@ -69,8 +88,9 @@ final class TorrServerClient {
 
     void prepareMagnet(String magnet, String title, Callback callback) {
         final int operation = operationGeneration.incrementAndGet();
-        executor.execute(() -> {
+        submit(() -> {
             try {
+                if (!isActive(operation)) throw new OperationCancelled();
                 progress(callback, "Передаю резервную magnet-ссылку в TorrServer…", operation);
                 JSONObject request = new JSONObject();
                 request.put("action", "add");
@@ -78,6 +98,7 @@ final class TorrServerClient {
                 request.put("title", title == null ? "" : title);
                 request.put("category", "movie");
                 request.put("save_to_db", false);
+                if (!isActive(operation)) throw new OperationCancelled();
                 JSONObject status = postJson("/torrents", request);
                 waitForMetadata(status, callback, operation);
             } catch (Throwable e) {
@@ -88,10 +109,11 @@ final class TorrServerClient {
 
     void prepareTorrent(File file, String title, Callback callback) {
         final int operation = operationGeneration.incrementAndGet();
-        executor.execute(() -> {
+        if (!submit(() -> {
             try {
+                if (!isActive(operation)) throw new OperationCancelled();
                 progress(callback, "Передаю авторизованный .torrent в TorrServer…", operation);
-                JSONObject status = uploadTorrent(file, title);
+                JSONObject status = uploadTorrent(file, title, operation);
                 waitForMetadata(status, callback, operation);
             } catch (Throwable e) {
                 if (isActive(operation)) fail(callback, friendly(e), e, operation);
@@ -99,58 +121,74 @@ final class TorrServerClient {
                 //noinspection ResultOfMethodCallIgnored
                 file.delete();
             }
-        });
+        })) {
+            // A completed authenticated download may race Activity teardown.
+            // Never retain its temporary file when the client cannot accept work.
+            //noinspection ResultOfMethodCallIgnored
+            file.delete();
+        }
+    }
+
+    /** Cancels metadata work before a newer RuTracker topic is downloaded. */
+    void cancelPendingPreparation() {
+        operationGeneration.incrementAndGet();
+    }
+
+    private boolean submit(Runnable work) {
+        if (destroyed) return false;
+        try {
+            executor.execute(work);
+            return true;
+        } catch (RejectedExecutionException ignored) {
+            return false;
+        }
     }
 
     private void waitForMetadata(JSONObject first, Callback callback, int operation) throws Exception {
         String hash = first.optString("hash");
         if (hash.isEmpty()) throw new IOException("TorrServer не вернул hash");
-        JSONObject status = first;
-        long started = SystemClock.elapsedRealtime();
-        long deadline = started + METADATA_TIMEOUT_MS;
-        long nextProgress = started;
-        while (SystemClock.elapsedRealtime() < deadline) {
-            if (!isActive(operation)) {
-                removeTorrentQuietly(hash);
-                throw new OperationCancelled();
+        boolean handedOff = false;
+        try {
+            JSONObject status = first;
+            long started = SystemClock.elapsedRealtime();
+            long deadline = started + METADATA_TIMEOUT_MS;
+            long nextProgress = started;
+            while (SystemClock.elapsedRealtime() < deadline) {
+                if (!isActive(operation)) throw new OperationCancelled();
+                JSONArray files = status.optJSONArray("file_stats");
+                if (files != null && files.length() > 0) {
+                    List<TorrentFile> videoFiles = collectVideoFiles(files);
+                    if (videoFiles.isEmpty()) {
+                        throw new IOException("В раздаче нет поддерживаемых видеофайлов");
+                    }
+                    if (!isActive(operation)) throw new OperationCancelled();
+                    handedOff = true;
+                    main.post(() -> {
+                        if (isActive(operation)) callback.onFilesReady(hash, videoFiles);
+                        else dropTorrentAsync(hash);
+                    });
+                    return;
+                }
+                long now = SystemClock.elapsedRealtime();
+                if (now >= nextProgress) {
+                    long elapsedSeconds = (now - started) / 1000;
+                    progress(callback, "Получаю список файлов: " + elapsedSeconds
+                            + " / 180 с. Ищу сидов…", operation);
+                    nextProgress = now + 5_000;
+                }
+                Thread.sleep(POLL_INTERVAL_MS);
+                JSONObject request = new JSONObject();
+                request.put("action", "get");
+                request.put("hash", hash);
+                status = postJson("/torrents", request);
             }
-            JSONArray files = status.optJSONArray("file_stats");
-            if (files != null && files.length() > 0) {
-                JSONObject selected = chooseVideo(files);
-                int id = selected.optInt("id", -1);
-                String path = selected.optString("path");
-                long fileSizeBytes = selected.optLong("length", 0);
-                if (id < 0 || path.isEmpty()) throw new IOException("Некорректный список файлов");
-                String name = path.substring(path.lastIndexOf('/') + 1);
-                Uri stream = Uri.parse(BASE).buildUpon()
-                        .appendPath("stream")
-                        .appendPath(name)
-                        .appendQueryParameter("link", hash)
-                        .appendQueryParameter("index", String.valueOf(id))
-                        .appendQueryParameter("play", "")
-                        .appendQueryParameter("preload", "")
-                        .build();
-                String url = stream.toString();
-                main.post(() -> {
-                    if (isActive(operation)) callback.onReady(url, name, fileSizeBytes);
-                });
-                return;
-            }
-            long now = SystemClock.elapsedRealtime();
-            if (now >= nextProgress) {
-                long elapsedSeconds = (now - started) / 1000;
-                progress(callback, "Получаю список файлов: " + elapsedSeconds
-                        + " / 180 с. Ищу сидов…", operation);
-                nextProgress = now + 5_000;
-            }
-            Thread.sleep(POLL_INTERVAL_MS);
-            JSONObject request = new JSONObject();
-            request.put("action", "get");
-            request.put("hash", hash);
-            status = postJson("/torrents", request);
+            throw new IOException("Не удалось получить метаданные за 3 минуты. Выберите зелёную раздачу с 10+ сидами");
+        } finally {
+            // If cancellation, destruction, timeout, or an HTTP error happens
+            // before the file list reaches the UI, do not leave a hidden
+            // metadata session competing with the next stream for bandwidth.
+            if (!handedOff) removeTorrentQuietly(hash);
         }
-        removeTorrentQuietly(hash);
-        throw new IOException("Не удалось получить метаданные за 3 минуты. Выберите зелёную раздачу с 10+ сидами");
     }
 
     private void removeTorrentQuietly(String hash) {
@@ -162,28 +200,42 @@ final class TorrServerClient {
         } catch (Throwable ignored) {}
     }
 
-    private static JSONObject chooseVideo(JSONArray files) throws Exception {
-        JSONObject largestVideo = null;
-        JSONObject largestAny = null;
-        long videoLength = -1;
-        long anyLength = -1;
+    private static List<TorrentFile> collectVideoFiles(JSONArray files) throws Exception {
+        List<TorrentFile> result = new ArrayList<>();
         for (int i = 0; i < files.length(); i++) {
             JSONObject file = files.getJSONObject(i);
-            long length = file.optLong("length", 0);
-            String path = file.optString("path").toLowerCase(Locale.ROOT);
-            if (length > anyLength) { largestAny = file; anyLength = length; }
-            if (isVideo(path) && length > videoLength) { largestVideo = file; videoLength = length; }
+            int id = file.optInt("id", -1);
+            String path = file.optString("path");
+            if (id >= 0 && !path.isEmpty() && isVideo(path)) {
+                result.add(new TorrentFile(id, path, file.optLong("length", 0)));
+            }
         }
-        if (largestVideo != null) return largestVideo;
-        if (largestAny != null) return largestAny;
-        throw new IOException("В раздаче нет файлов");
+        return Collections.unmodifiableList(result);
     }
 
     private static boolean isVideo(String path) {
-        return path.endsWith(".mkv") || path.endsWith(".mp4") || path.endsWith(".avi")
-                || path.endsWith(".m4v") || path.endsWith(".mov") || path.endsWith(".webm")
-                || path.endsWith(".ts") || path.endsWith(".m2ts") || path.endsWith(".mpg")
-                || path.endsWith(".mpeg");
+        String lower = path.toLowerCase(java.util.Locale.ROOT);
+        return lower.endsWith(".mkv") || lower.endsWith(".mp4") || lower.endsWith(".avi")
+                || lower.endsWith(".m4v") || lower.endsWith(".mov") || lower.endsWith(".webm")
+                || lower.endsWith(".ts") || lower.endsWith(".m2ts") || lower.endsWith(".mpg")
+                || lower.endsWith(".mpeg");
+    }
+
+    static String buildStreamUrl(String hash, TorrentFile file) {
+        if (hash == null || !hash.matches("(?i)[0-9a-f]{40}")) {
+            throw new IllegalArgumentException("Некорректный hash торрента");
+        }
+        if (file == null || file.id < 0 || file.fileName().isEmpty()) {
+            throw new IllegalArgumentException("Некорректный видеофайл");
+        }
+        return Uri.parse(BASE).buildUpon()
+                .appendPath("stream")
+                .appendPath(file.fileName())
+                .appendQueryParameter("link", hash)
+                .appendQueryParameter("index", String.valueOf(file.id))
+                .appendQueryParameter("play", "")
+                .build()
+                .toString();
     }
 
     private static JSONObject postJson(String path, JSONObject request) throws Exception {
@@ -217,7 +269,8 @@ final class TorrServerClient {
         cleanup.start();
     }
 
-    private static JSONObject uploadTorrent(File file, String title) throws Exception {
+    private JSONObject uploadTorrent(File file, String title, int operation) throws Exception {
+        if (!isActive(operation)) throw new OperationCancelled();
         String boundary = "----RutrackerTv" + System.currentTimeMillis();
         HttpURLConnection connection = open("/torrent/upload", "POST", 10_000, 30_000);
         connection.setDoOutput(true);
@@ -232,10 +285,15 @@ final class TorrServerClient {
             try (InputStream input = new FileInputStream(file)) {
                 byte[] buffer = new byte[16 * 1024];
                 int read;
-                while ((read = input.read(buffer)) != -1) out.write(buffer, 0, read);
+                while ((read = input.read(buffer)) != -1) {
+                    if (!isActive(operation)) throw new OperationCancelled();
+                    out.write(buffer, 0, read);
+                }
             }
+            if (!isActive(operation)) throw new OperationCancelled();
             out.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
         }
+        if (!isActive(operation)) throw new OperationCancelled();
         return new JSONObject(readResponse(connection));
     }
 
@@ -305,7 +363,6 @@ final class TorrServerClient {
         destroyed = true;
         operationGeneration.incrementAndGet();
         executor.shutdownNow();
-        main.removeCallbacksAndMessages(null);
     }
 
     private static final class OperationCancelled extends IOException {}
